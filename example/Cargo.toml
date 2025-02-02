@@ -1,9 +1,8 @@
 [package]
-name = "micrograd"
+name = "example"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-ordered-float = "4.6.0"
-thiserror = "2.0.11"
+micrograd = { path = ".." }
