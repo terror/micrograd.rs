@@ -39,6 +39,7 @@ pub enum Operation {
   Mul,
   Div,
   Neg,
+  Tanh,
 }
 
 impl Display for Operation {
@@ -55,6 +56,7 @@ impl Display for Operation {
         Div => "÷",
         Neg => "-",
         Input => "",
+        Tanh => "tanh",
       }
     )
   }
@@ -147,6 +149,7 @@ impl Value {
   pub fn to_graphviz_graph(&self) -> Graph {
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
+
     let mut nodes = Vec::new();
     let mut op_nodes = Vec::new();
 
@@ -155,14 +158,19 @@ impl Value {
     while let Some(cur) = queue.pop_front() {
       if visited.insert(cur.data) {
         nodes.push(cur.clone());
+
         if cur.operation != Operation::Input {
           op_nodes.push(cur.clone());
         }
+
         for child in &cur.children {
           queue.push_back(child.clone());
         }
       }
     }
+
+    nodes.sort_by(|a, b| a.data.partial_cmp(&b.data).unwrap());
+    op_nodes.sort_by(|a, b| a.data.partial_cmp(&b.data).unwrap());
 
     let mut ids = HashMap::new();
     let mut op_ids = HashMap::new();
@@ -177,7 +185,6 @@ impl Value {
 
     let mut stmts = Vec::new();
 
-    // Add value nodes
     for (i, node) in nodes.iter().enumerate() {
       let label_attr = Attribute(
         Id::Plain("label".to_string()),
@@ -192,7 +199,6 @@ impl Value {
       stmts.push(Stmt::Node(n));
     }
 
-    // Add operator nodes
     for (i, node) in op_nodes.iter().enumerate() {
       let label_attr = Attribute(
         Id::Plain("label".to_string()),
@@ -207,36 +213,43 @@ impl Value {
       stmts.push(Stmt::Node(n));
     }
 
-    // Add edges
+    let mut edges = Vec::new();
+
     for node in &op_nodes {
       let op_i = op_ids[&node.data];
       let node_i = ids[&node.data];
 
-      // Edge from operator to result
-      let e = Edge {
+      edges.push(Edge {
         ty: EdgeTy::Pair(
           Vertex::N(NodeId(Id::Plain(format!("op{}", op_i)), None)),
           Vertex::N(NodeId(Id::Plain(format!("node{}", node_i)), None)),
         ),
         attributes: vec![],
-      };
-      stmts.push(Stmt::Edge(e));
+      });
 
-      // Edges from inputs to operator
-      for child in &node.children {
+      let mut sorted_children: Vec<_> = node.children.iter().collect();
+      sorted_children.sort_by(|a, b| a.data.partial_cmp(&b.data).unwrap());
+
+      for child in sorted_children {
         let ci = ids[&child.data];
 
-        let e = Edge {
+        edges.push(Edge {
           ty: EdgeTy::Pair(
             Vertex::N(NodeId(Id::Plain(format!("node{}", ci)), None)),
             Vertex::N(NodeId(Id::Plain(format!("op{}", op_i)), None)),
           ),
           attributes: vec![],
-        };
-
-        stmts.push(Stmt::Edge(e));
+        });
       }
     }
+
+    edges.sort_by(|a, b| {
+      let a_str = format!("{:?}", a);
+      let b_str = format!("{:?}", b);
+      a_str.cmp(&b_str)
+    });
+
+    stmts.extend(edges.into_iter().map(Stmt::Edge));
 
     Graph::DiGraph {
       id: Id::Plain("G".to_string()),
@@ -248,7 +261,7 @@ impl Value {
   pub fn to_dot_string(&self) -> String {
     let g = self.to_graphviz_graph();
     let mut ctx = PrinterContext::default();
-    g.print(&mut ctx)
+    format!("{}\n", g.print(&mut ctx))
   }
 }
 
@@ -314,9 +327,31 @@ impl_value_binary_op!(
 
 impl_value_unary_op!(Neg, neg, -, Operation::Neg);
 
+pub trait Tanh {
+  type Output;
+
+  fn tanh(self) -> Self::Output;
+}
+
+impl Tanh for Value {
+  type Output = Result<Value, ValueError>;
+
+  fn tanh(self) -> Self::Output {
+    Value::unary_op(self, |x| x.tanh(), Operation::Tanh)
+  }
+}
+
+impl Tanh for &Value {
+  type Output = Result<Value, ValueError>;
+
+  fn tanh(self) -> Self::Output {
+    Value::unary_op(self.clone(), |x| x.tanh(), Operation::Tanh)
+  }
+}
+
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use {super::*, indoc::indoc};
 
   #[test]
   fn new() {
@@ -514,10 +549,25 @@ mod tests {
   fn dot_generation_test() {
     let a = Value::new(2.0).unwrap();
     let b = Value::new(3.0).unwrap();
+
     let sum = (a + b).unwrap();
+
     let dot = sum.to_dot_string();
-    assert!(dot.contains("digraph G"));
-    assert!(dot.contains("label=5\\nAdd"));
+
+    pretty_assertions::assert_eq!(
+      dot,
+      indoc! {"
+        digraph G {
+          node0[label=\"2\"]
+          node1[label=\"3\"]
+          node2[label=\"5\"]
+          op0[label=\"+\"]
+          node0 -> op0
+          node1 -> op0
+          op0 -> node2
+        }
+      "}
+    );
   }
 
   #[test]
@@ -525,9 +575,62 @@ mod tests {
     let a = Value::new(2.0).unwrap();
     let b = Value::new(3.0).unwrap();
     let c = Value::new(4.0).unwrap();
+
     let sum = (a + b).unwrap();
     let result = ((sum).clone() * c).unwrap();
+
     let dot = result.to_dot_string();
-    assert!(dot.contains("node0[label=20\\nMul]"));
+
+    pretty_assertions::assert_eq!(
+      dot,
+      indoc! {"
+        digraph G {
+          node0[label=\"2\"]
+          node1[label=\"3\"]
+          node2[label=\"4\"]
+          node3[label=\"5\"]
+          node4[label=\"20\"]
+          op0[label=\"+\"]
+          op1[label=\"×\"]
+          node0 -> op0
+          node1 -> op0
+          node2 -> op1
+          node3 -> op1
+          op0 -> node3
+          op1 -> node4
+        }
+      "}
+    );
+  }
+
+  #[test]
+  fn tanh_operation() {
+    let v = Value::new(0.0).unwrap();
+    let result = v.tanh().unwrap();
+    assert_eq!(result.operation, Operation::Tanh);
+    assert_eq!(result.get(), 0.0);
+
+    let v = Value::new(1.0).unwrap();
+    let result = v.tanh().unwrap();
+    assert_eq!(result.get(), 0.7615941559557649); // tanh(1)
+
+    let v = Value::new(-2.0).unwrap();
+    let result = v.tanh().unwrap();
+    assert_eq!(result.get(), -0.9640275800758169); // tanh(-2)
+  }
+
+  #[test]
+  fn tanh_with_children() {
+    let v = Value::new(1.0).unwrap();
+    let result = v.tanh().unwrap();
+    assert_eq!(result.children().len(), 1);
+    assert_eq!(result.children().iter().next().unwrap().get(), 1.0);
+  }
+
+  #[test]
+  fn reference_tanh() {
+    let v = Value::new(1.0).unwrap();
+    let result = (&v).tanh().unwrap();
+    assert_eq!(result.get(), 0.7615941559557649);
   }
 }
