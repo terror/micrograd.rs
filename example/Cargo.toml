@@ -5,4 +5,5 @@ edition = "2021"
 publish = false
 
 [dependencies]
+graphviz-rust = "0.9.3"
 micrograd = { path = ".." }
