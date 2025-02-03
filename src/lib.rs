@@ -1,16 +1,22 @@
 use {
   graphviz_rust::{
+    cmd::Format,
     dot_structures::{
       Attribute, Edge, EdgeTy, Graph, Id, Node, NodeId, Stmt, Vertex,
     },
+    exec,
     printer::{DotPrinter, PrinterContext},
   },
   ordered_float::NotNan,
   std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Display, Formatter},
+    fs,
     hash::{Hash, Hasher},
+    io,
     ops::{Add, Div, Mul, Neg, Sub},
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
   },
   thiserror::Error,
 };
@@ -44,29 +50,38 @@ pub enum Operation {
 
 impl Display for Operation {
   fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-    use Operation::*;
-
     write!(
       f,
       "{}",
       match self {
-        Add => "+",
-        Sub => "-",
-        Mul => "×",
-        Div => "÷",
-        Neg => "-",
-        Input => "",
-        Tanh => "tanh",
+        Self::Add => "+",
+        Self::Sub => "-",
+        Self::Mul => "×",
+        Self::Div => "÷",
+        Self::Neg => "-",
+        Self::Input => "",
+        Self::Tanh => "tanh",
       }
     )
   }
 }
 
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone)]
 pub struct Value {
+  id: usize,
   data: NotNan<f64>,
   operation: Operation,
   children: HashSet<Value>,
+}
+
+impl Display for Value {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    let g: Graph = self.clone().into();
+    let mut ctx = PrinterContext::default();
+    write!(f, "{}\n", g.print(&mut ctx))
+  }
 }
 
 impl PartialEq for Value {
@@ -79,190 +94,28 @@ impl Eq for Value {}
 
 impl Hash for Value {
   fn hash<H: Hasher>(&self, state: &mut H) {
-    self.data.hash(state);
+    self.id.hash(state);
   }
 }
 
-impl Value {
-  pub fn new(data: f64) -> Result<Self, ValueError> {
-    Ok(Self {
-      data: NotNan::new(data).map_err(ValueError::from)?,
-      operation: Operation::Input,
-      children: HashSet::new(),
-    })
-  }
+macro_rules! impl_value_unary_op {
+  ($trait_name:ident, $func_name:ident, $op_symbol:tt, $op_variant:expr) => {
+    impl $trait_name for Value {
+      type Output = Result<Value, ValueError>;
 
-  pub fn get(&self) -> f64 {
-    self.data.into_inner()
-  }
-
-  pub fn children(&self) -> &HashSet<Value> {
-    &self.children
-  }
-
-  fn binary_op(
-    left: Self,
-    right: Self,
-    op_fn: impl FnOnce(f64, f64) -> f64,
-    operation: Operation,
-  ) -> Result<Self, ValueError> {
-    let result = op_fn(left.data.into_inner(), right.data.into_inner());
-
-    if result.is_infinite() {
-      return Err(ValueError::Overflow);
-    }
-
-    let mut new_value = Self {
-      data: NotNan::new(result).map_err(ValueError::from)?,
-      operation,
-      children: HashSet::new(),
-    };
-
-    new_value.children.insert(left);
-    new_value.children.insert(right);
-
-    Ok(new_value)
-  }
-
-  fn unary_op(
-    val: Self,
-    op_fn: impl FnOnce(f64) -> f64,
-    operation: Operation,
-  ) -> Result<Self, ValueError> {
-    let result = op_fn(val.data.into_inner());
-
-    if result.is_infinite() {
-      return Err(ValueError::Overflow);
-    }
-
-    let mut new_value = Self {
-      data: NotNan::new(result).map_err(ValueError::from)?,
-      operation,
-      children: HashSet::new(),
-    };
-
-    new_value.children.insert(val);
-
-    Ok(new_value)
-  }
-
-  pub fn to_graphviz_graph(&self) -> Graph {
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::new();
-
-    let mut nodes = Vec::new();
-    let mut op_nodes = Vec::new();
-
-    queue.push_back(self.clone());
-
-    while let Some(cur) = queue.pop_front() {
-      if visited.insert(cur.data) {
-        nodes.push(cur.clone());
-
-        if cur.operation != Operation::Input {
-          op_nodes.push(cur.clone());
-        }
-
-        for child in &cur.children {
-          queue.push_back(child.clone());
-        }
+      fn $func_name(self) -> Self::Output {
+        Value::unary_op(self, |a| $op_symbol a, $op_variant)
       }
     }
 
-    nodes.sort_by(|a, b| a.data.partial_cmp(&b.data).unwrap());
-    op_nodes.sort_by(|a, b| a.data.partial_cmp(&b.data).unwrap());
+    impl $trait_name for &Value {
+      type Output = Result<Value, ValueError>;
 
-    let mut ids = HashMap::new();
-    let mut op_ids = HashMap::new();
-
-    for (i, node) in nodes.iter().enumerate() {
-      ids.insert(node.data, i);
-    }
-
-    for (i, node) in op_nodes.iter().enumerate() {
-      op_ids.insert(node.data, i);
-    }
-
-    let mut stmts = Vec::new();
-
-    for (i, node) in nodes.iter().enumerate() {
-      let label_attr = Attribute(
-        Id::Plain("label".to_string()),
-        Id::Plain(format!("\"{}\"", node.get())),
-      );
-
-      let n = Node {
-        id: NodeId(Id::Plain(format!("node{}", i)), None),
-        attributes: vec![label_attr],
-      };
-
-      stmts.push(Stmt::Node(n));
-    }
-
-    for (i, node) in op_nodes.iter().enumerate() {
-      let label_attr = Attribute(
-        Id::Plain("label".to_string()),
-        Id::Plain(format!("\"{}\"", node.operation.to_string())),
-      );
-
-      let n = Node {
-        id: NodeId(Id::Plain(format!("op{}", i)), None),
-        attributes: vec![label_attr],
-      };
-
-      stmts.push(Stmt::Node(n));
-    }
-
-    let mut edges = Vec::new();
-
-    for node in &op_nodes {
-      let op_i = op_ids[&node.data];
-      let node_i = ids[&node.data];
-
-      edges.push(Edge {
-        ty: EdgeTy::Pair(
-          Vertex::N(NodeId(Id::Plain(format!("op{}", op_i)), None)),
-          Vertex::N(NodeId(Id::Plain(format!("node{}", node_i)), None)),
-        ),
-        attributes: vec![],
-      });
-
-      let mut sorted_children: Vec<_> = node.children.iter().collect();
-      sorted_children.sort_by(|a, b| a.data.partial_cmp(&b.data).unwrap());
-
-      for child in sorted_children {
-        let ci = ids[&child.data];
-
-        edges.push(Edge {
-          ty: EdgeTy::Pair(
-            Vertex::N(NodeId(Id::Plain(format!("node{}", ci)), None)),
-            Vertex::N(NodeId(Id::Plain(format!("op{}", op_i)), None)),
-          ),
-          attributes: vec![],
-        });
+      fn $func_name(self) -> Self::Output {
+        Value::unary_op(self.clone(), |a| $op_symbol a, $op_variant)
       }
     }
-
-    edges.sort_by(|a, b| {
-      let a_str = format!("{:?}", a);
-      let b_str = format!("{:?}", b);
-      a_str.cmp(&b_str)
-    });
-
-    stmts.extend(edges.into_iter().map(Stmt::Edge));
-
-    Graph::DiGraph {
-      id: Id::Plain("G".to_string()),
-      strict: false,
-      stmts,
-    }
-  }
-
-  pub fn to_dot_string(&self) -> String {
-    let g = self.to_graphviz_graph();
-    let mut ctx = PrinterContext::default();
-    format!("{}\n", g.print(&mut ctx))
-  }
+  };
 }
 
 macro_rules! impl_value_binary_op {
@@ -282,26 +135,6 @@ macro_rules! impl_value_binary_op {
       fn $func_name(self, rhs: Self) -> Self::Output {
         $check(rhs)?;
         Value::binary_op(self.clone(), rhs.clone(), |a, b| a $op_symbol b, $op_variant)
-      }
-    }
-  };
-}
-
-macro_rules! impl_value_unary_op {
-  ($trait_name:ident, $func_name:ident, $op_symbol:tt, $op_variant:expr) => {
-    impl $trait_name for Value {
-      type Output = Result<Value, ValueError>;
-
-      fn $func_name(self) -> Self::Output {
-        Value::unary_op(self, |a| $op_symbol a, $op_variant)
-      }
-    }
-
-    impl $trait_name for &Value {
-      type Output = Result<Value, ValueError>;
-
-      fn $func_name(self) -> Self::Output {
-        Value::unary_op(self.clone(), |a| $op_symbol a, $op_variant)
       }
     }
   };
@@ -349,9 +182,222 @@ impl Tanh for &Value {
   }
 }
 
+impl Into<Graph> for Value {
+  fn into(self) -> Graph {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+
+    let mut nodes = Vec::new();
+    let mut op_nodes = Vec::new();
+
+    queue.push_back(self.clone());
+
+    while let Some(cur) = queue.pop_front() {
+      if visited.insert(cur.id) {
+        nodes.push(cur.clone());
+
+        if cur.operation != Operation::Input {
+          op_nodes.push(cur.clone());
+        }
+
+        for child in &cur.children {
+          queue.push_back(child.clone());
+        }
+      }
+    }
+
+    nodes.sort_by_key(|v| v.id);
+    op_nodes.sort_by_key(|v| v.id);
+
+    let mut ids = HashMap::new();
+    let mut op_ids = HashMap::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+      ids.insert(node.id, i);
+    }
+
+    for (i, node) in op_nodes.iter().enumerate() {
+      op_ids.insert(node.id, i);
+    }
+
+    let mut stmts = Vec::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+      let label_attr = Attribute(
+        Id::Plain("label".to_string()),
+        Id::Plain(format!("\"{}\"", node.get())),
+      );
+
+      let n = Node {
+        id: NodeId(Id::Plain(format!("node{}", i)), None),
+        attributes: vec![label_attr],
+      };
+
+      stmts.push(Stmt::Node(n));
+    }
+
+    for (i, node) in op_nodes.iter().enumerate() {
+      let label_attr = Attribute(
+        Id::Plain("label".to_string()),
+        Id::Plain(format!("\"{}\"", node.operation.to_string())),
+      );
+
+      let n = Node {
+        id: NodeId(Id::Plain(format!("op{}", i)), None),
+        attributes: vec![label_attr],
+      };
+
+      stmts.push(Stmt::Node(n));
+    }
+
+    let mut edges = Vec::new();
+
+    for node in &op_nodes {
+      let op_i = op_ids[&node.id];
+      let node_i = ids[&node.id];
+
+      edges.push(Edge {
+        ty: EdgeTy::Pair(
+          Vertex::N(NodeId(Id::Plain(format!("op{}", op_i)), None)),
+          Vertex::N(NodeId(Id::Plain(format!("node{}", node_i)), None)),
+        ),
+        attributes: vec![],
+      });
+
+      let mut sorted_children: Vec<_> = node.children.iter().collect();
+      sorted_children.sort_by_key(|child| child.id);
+
+      for child in sorted_children {
+        let ci = ids[&child.id];
+
+        edges.push(Edge {
+          ty: EdgeTy::Pair(
+            Vertex::N(NodeId(Id::Plain(format!("node{}", ci)), None)),
+            Vertex::N(NodeId(Id::Plain(format!("op{}", op_i)), None)),
+          ),
+          attributes: vec![],
+        });
+      }
+    }
+
+    edges.sort_by(|a, b| {
+      let a_str = format!("{:?}", a);
+      let b_str = format!("{:?}", b);
+      a_str.cmp(&b_str)
+    });
+
+    stmts.extend(edges.into_iter().map(Stmt::Edge));
+
+    Graph::DiGraph {
+      id: Id::Plain("G".to_string()),
+      strict: false,
+      stmts,
+    }
+  }
+}
+
+impl Value {
+  pub fn new(data: f64) -> Result<Self, ValueError> {
+    Ok(Self {
+      id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+      data: NotNan::new(data).map_err(ValueError::from)?,
+      operation: Operation::Input,
+      children: HashSet::new(),
+    })
+  }
+
+  pub fn get(&self) -> f64 {
+    self.data.into_inner()
+  }
+
+  pub fn children(&self) -> &HashSet<Value> {
+    &self.children
+  }
+
+  fn binary_op(
+    left: Self,
+    right: Self,
+    op_fn: impl FnOnce(f64, f64) -> f64,
+    operation: Operation,
+  ) -> Result<Self, ValueError> {
+    let result = op_fn(left.data.into_inner(), right.data.into_inner());
+
+    if result.is_infinite() {
+      return Err(ValueError::Overflow);
+    }
+
+    let mut new_value = Self {
+      id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+      data: NotNan::new(result).map_err(ValueError::from)?,
+      operation,
+      children: HashSet::new(),
+    };
+
+    new_value.children.insert(left);
+    new_value.children.insert(right);
+
+    Ok(new_value)
+  }
+
+  fn unary_op(
+    val: Self,
+    op_fn: impl FnOnce(f64) -> f64,
+    operation: Operation,
+  ) -> Result<Self, ValueError> {
+    let result = op_fn(val.data.into_inner());
+
+    if result.is_infinite() {
+      return Err(ValueError::Overflow);
+    }
+
+    let mut new_value = Self {
+      id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+      data: NotNan::new(result).map_err(ValueError::from)?,
+      operation,
+      children: HashSet::new(),
+    };
+
+    new_value.children.insert(val);
+
+    Ok(new_value)
+  }
+
+  pub fn graph(self, path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+
+    let format = path
+      .extension()
+      .and_then(|ext| ext.to_str())
+      .and_then(|ext| match ext.to_lowercase().as_str() {
+        "png" => Some(Format::Png),
+        "svg" => Some(Format::Svg),
+        "pdf" => Some(Format::Pdf),
+        "jpg" | "jpeg" => Some(Format::Jpg),
+        "gif" => Some(Format::Gif),
+        "dot" => Some(Format::Dot),
+        _ => None,
+      })
+      .ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::InvalidInput,
+          "Unsupported or missing file extension. Supported formats: png, svg, pdf, jpg/jpeg, gif, dot"
+        )
+      })?;
+
+    fs::write(
+      path,
+      exec(
+        self.into(),
+        &mut PrinterContext::default(),
+        vec![format.into()],
+      )?,
+    )
+  }
+}
+
 #[cfg(test)]
 mod tests {
-  use {super::*, indoc::indoc};
+  use {super::*, indoc::indoc, tempdir::TempDir};
 
   #[test]
   fn new() {
@@ -552,7 +598,7 @@ mod tests {
 
     let sum = (a + b).unwrap();
 
-    let dot = sum.to_dot_string();
+    let dot = sum.to_string();
 
     pretty_assertions::assert_eq!(
       dot,
@@ -579,7 +625,7 @@ mod tests {
     let sum = (a + b).unwrap();
     let result = ((sum).clone() * c).unwrap();
 
-    let dot = result.to_dot_string();
+    let dot = result.to_string();
 
     pretty_assertions::assert_eq!(
       dot,
@@ -632,5 +678,112 @@ mod tests {
     let v = Value::new(1.0).unwrap();
     let result = (&v).tanh().unwrap();
     assert_eq!(result.get(), 0.7615941559557649);
+  }
+
+  #[test]
+  fn png_output() -> io::Result<()> {
+    let dir = TempDir::new("test")?;
+    let file_path = dir.path().join("test.png");
+
+    let a = Value::new(2.0).unwrap();
+    let b = Value::new(3.0).unwrap();
+    let c = (a + b).unwrap();
+
+    c.graph(&file_path)?;
+
+    let metadata = fs::metadata(&file_path)?;
+    assert!(metadata.len() > 0);
+
+    Ok(())
+  }
+
+  #[test]
+  fn svg_output() -> io::Result<()> {
+    let dir = TempDir::new("test")?;
+    let file_path = dir.path().join("test.svg");
+
+    let a = Value::new(2.0).unwrap();
+    let b = Value::new(3.0).unwrap();
+    let c = (a + b).unwrap();
+
+    c.graph(&file_path)?;
+
+    let metadata = fs::metadata(&file_path)?;
+    assert!(metadata.len() > 0);
+
+    let content = fs::read_to_string(&file_path)?;
+    assert!(content.contains("<svg"));
+    assert!(content.contains("</svg>"));
+
+    Ok(())
+  }
+
+  #[test]
+  fn dot_output() -> io::Result<()> {
+    let dir = TempDir::new("test")?;
+    let file_path = dir.path().join("test.dot");
+
+    let a = Value::new(2.0).unwrap();
+    let b = Value::new(3.0).unwrap();
+    let c = (a + b).unwrap();
+
+    c.graph(&file_path)?;
+
+    let metadata = fs::metadata(&file_path)?;
+    assert!(metadata.len() > 0);
+
+    let content = fs::read_to_string(&file_path)?;
+    assert!(content.contains("digraph G {"));
+    assert!(content.contains("}"));
+
+    Ok(())
+  }
+
+  #[test]
+  fn invalid_extension() {
+    let a = Value::new(1.0).unwrap();
+
+    let result = a.graph("test.invalid");
+
+    assert!(result.is_err());
+
+    if let Err(e) = result {
+      assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+      assert!(e
+        .to_string()
+        .contains("Unsupported or missing file extension"));
+    }
+  }
+
+  #[test]
+  fn missing_extension() {
+    let a = Value::new(1.0).unwrap();
+
+    let result = a.graph("test");
+
+    assert!(result.is_err());
+
+    if let Err(e) = result {
+      assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+      assert!(e
+        .to_string()
+        .contains("Unsupported or missing file extension"));
+    }
+  }
+
+  #[test]
+  fn empty_filename() {
+    let a = Value::new(1.0).unwrap();
+
+    let result = a.graph("");
+
+    assert!(result.is_err());
+
+    if let Err(e) = result {
+      assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+      assert!(e
+        .to_string()
+        .contains("Unsupported or missing file extension"));
+    }
   }
 }
